@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>파일 서버</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #fff; --text: #1d2129; --muted: #6b7280;
+    --line: #e5e7eb; --accent: #2563eb; --hover: #f1f5fd;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14161a; --panel: #1c1f26; --text: #e6e8ec; --muted: #9aa1ad;
+      --line: #2b303a; --accent: #6ea0ff; --hover: #232a38;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 "Segoe UI", "Malgun Gothic", system-ui, sans-serif; }
+  header { display: flex; gap: 12px; align-items: center; padding: 12px 16px;
+    background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 1; }
+  #crumbs { flex: 1; min-width: 0; display: flex; flex-wrap: wrap; gap: 2px; align-items: center; }
+  #crumbs a { color: var(--accent); text-decoration: none; padding: 2px 4px; border-radius: 4px; }
+  #crumbs a:hover { background: var(--hover); }
+  #crumbs span { color: var(--muted); }
+  input[type=search] { padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px;
+    background: var(--bg); color: var(--text); width: 200px; max-width: 40vw; }
+  button, label.btn { padding: 6px 12px; border: 1px solid var(--line); border-radius: 6px;
+    background: var(--panel); color: var(--text); cursor: pointer; font: inherit; }
+  button:hover, label.btn:hover { background: var(--hover); }
+  main { max-width: 1100px; margin: 16px auto; padding: 0 16px; }
+  table { width: 100%; border-collapse: collapse; background: var(--panel);
+    border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 600; cursor: pointer; user-select: none; }
+  tr:last-child td { border-bottom: 0; }
+  tbody tr:hover { background: var(--hover); }
+  td.name { width: 100%; max-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  td.name a { color: var(--text); text-decoration: none; }
+  td.name a:hover { color: var(--accent); text-decoration: underline; }
+  td.num { text-align: right; color: var(--muted); }
+  td.act a { color: var(--accent); text-decoration: none; }
+  .msg { padding: 24px; text-align: center; color: var(--muted); }
+  #drop { position: fixed; inset: 0; background: rgba(37,99,235,.15); border: 3px dashed var(--accent);
+    display: none; align-items: center; justify-content: center; font-size: 22px; z-index: 5; pointer-events: none; }
+  #toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); background: #111; color: #fff;
+    padding: 8px 16px; border-radius: 8px; display: none; z-index: 6; max-width: 90vw; }
+  #preview { position: fixed; inset: 0; background: rgba(0,0,0,.85); display: none;
+    align-items: center; justify-content: center; z-index: 4; }
+  #preview img, #preview video { max-width: 95vw; max-height: 92vh; }
+  @media (max-width: 600px) { .hide-sm { display: none; } }
+</style>
+</head>
+<body>
+<header>
+  <div id="crumbs"></div>
+  <input id="q" type="search" placeholder="검색">
+  <label class="btn" id="uploadBtn" hidden>업로드<input id="file" type="file" multiple hidden></label>
+</header>
+<main>
+  <table>
+    <thead><tr>
+      <th data-k="name">이름</th>
+      <th data-k="size" style="text-align:right">크기</th>
+      <th data-k="modified" class="hide-sm">수정한 날짜</th>
+      <th></th>
+    </tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <div id="state" class="msg"></div>
+</main>
+<div id="drop">여기에 놓아서 업로드</div>
+<div id="toast"></div>
+<div id="preview"></div>
+<script>
+const $ = s => document.querySelector(s);
+const enc = p => p.split('/').filter(Boolean).map(encodeURIComponent).join('/');
+let info = { shares: [], upload: false };
+let cur = { share: '', path: '' };   // 현재 위치
+let entries = [];
+let sort = { k: 'name', asc: true };
+
+const IMG = /\.(png|jpe?g|gif|webp|bmp|svg|avif)$/i;
+const VID = /\.(mp4|webm|mkv|mov|m4v|ogv)$/i;
+
+function fmtSize(n) {
+  if (n < 1024) return n + ' B';
+  const u = ['KB', 'MB', 'GB', 'TB']; let i = -1;
+  do { n /= 1024; i++; } while (n >= 1024 && i < u.length - 1);
+  return n.toFixed(n < 10 ? 1 : 0) + ' ' + u[i];
+}
+function fmtDate(s) {
+  if (!s) return '';
+  const d = new Date(s * 1000), p = x => String(x).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+function toast(msg) {
+  const t = $('#toast'); t.textContent = msg; t.style.display = 'block';
+  clearTimeout(toast.t); toast.t = setTimeout(() => t.style.display = 'none', 3500);
+}
+function esc(s) { return s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+
+function parseHash() {
+  const h = decodeURIComponent(location.hash.replace(/^#\/?/, ''));
+  const parts = h.split('/').filter(Boolean);
+  return { share: parts[0] || '', path: parts.slice(1).join('/') };
+}
+function href(share, path) { return '#/' + enc(share + (path ? '/' + path : '')); }
+
+function renderCrumbs() {
+  const c = $('#crumbs');
+  let h = `<a href="#/">공유</a>`;
+  if (cur.share) {
+    h += `<span>/</span><a href="${href(cur.share, '')}">${esc(cur.share)}</a>`;
+    let acc = '';
+    for (const seg of cur.path.split('/').filter(Boolean)) {
+      acc += (acc ? '/' : '') + seg;
+      h += `<span>/</span><a href="${href(cur.share, acc)}">${esc(seg)}</a>`;
+    }
+  }
+  c.innerHTML = h;
+  $('#uploadBtn').hidden = !(info.upload && cur.share);
+  document.title = (cur.share ? cur.share + (cur.path ? '/' + cur.path : '') + ' - ' : '') + '파일 서버';
+}
+
+function renderRows() {
+  const q = $('#q').value.trim().toLowerCase();
+  let list = entries.filter(e => !q || e.name.toLowerCase().includes(q));
+  const f = sort.asc ? 1 : -1;
+  list.sort((a, b) => {
+    if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1;
+    if (sort.k === 'name') return f * a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
+    return f * (a[sort.k] - b[sort.k]);
+  });
+  const rows = [];
+  if (!cur.share) {
+    for (const s of info.shares) rows.push(`<tr><td class="name">📁 <a href="${href(s, '')}">${esc(s)}</a></td><td></td><td class="hide-sm"></td><td></td></tr>`);
+  } else {
+    if (cur.path) {
+      const up = cur.path.split('/').slice(0, -1).join('/');
+      rows.push(`<tr><td class="name">⬆️ <a href="${href(cur.share, up)}">..</a></td><td></td><td class="hide-sm"></td><td></td></tr>`);
+    }
+    for (const e of list) {
+      const p = (cur.path ? cur.path + '/' : '') + e.name;
+      const url = `/files/${enc(cur.share + '/' + p)}`;
+      if (e.is_dir) {
+        rows.push(`<tr><td class="name">📁 <a href="${href(cur.share, p)}">${esc(e.name)}</a></td><td class="num"></td><td class="num hide-sm">${fmtDate(e.modified)}</td><td></td></tr>`);
+      } else {
+        const kind = IMG.test(e.name) ? 'img' : VID.test(e.name) ? 'vid' : '';
+        rows.push(`<tr><td class="name">📄 <a href="${url}" data-kind="${kind}" target="_blank">${esc(e.name)}</a></td><td class="num">${fmtSize(e.size)}</td><td class="num hide-sm">${fmtDate(e.modified)}</td><td class="act"><a href="${url}?dl=1">다운로드</a></td></tr>`);
+      }
+    }
+  }
+  $('#rows').innerHTML = rows.join('');
+  $('#state').textContent = rows.length ? '' : (q ? '검색 결과가 없습니다' : '비어 있습니다');
+}
+
+async function load() {
+  cur = parseHash();
+  renderCrumbs();
+  $('#q').value = '';
+  if (!cur.share) { entries = []; renderRows(); return; }
+  $('#state').textContent = '불러오는 중...';
+  try {
+    const r = await fetch(`/api/list/${enc(cur.share + '/' + cur.path)}`);
+    if (!r.ok) throw new Error(await r.text());
+    entries = await r.json();
+    renderRows();
+  } catch (e) {
+    entries = []; $('#rows').innerHTML = ''; $('#state').textContent = e.message;
+  }
+}
+
+// 이미지/동영상은 새 탭 대신 오버레이로 미리 보기
+$('#rows').addEventListener('click', e => {
+  const a = e.target.closest('a[data-kind]');
+  if (!a || !a.dataset.kind || e.ctrlKey || e.metaKey) return;
+  e.preventDefault();
+  const pv = $('#preview');
+  pv.innerHTML = a.dataset.kind === 'img' ? `<img src="${a.href}">` : `<video src="${a.href}" controls autoplay></video>`;
+  pv.style.display = 'flex';
+});
+$('#preview').addEventListener('click', e => {
+  if (e.target.tagName === 'VIDEO') return;
+  $('#preview').style.display = 'none'; $('#preview').innerHTML = '';
+});
+document.addEventListener('keydown', e => { if (e.key === 'Escape') $('#preview').click(); });
+
+document.querySelectorAll('th[data-k]').forEach(th => th.addEventListener('click', () => {
+  const k = th.dataset.k;
+  sort = { k, asc: sort.k === k ? !sort.asc : true };
+  renderRows();
+}));
+$('#q').addEventListener('input', renderRows);
+
+function uploadFiles(files) {
+  if (!info.upload || !cur.share || !files.length) return;
+  let done = 0, failed = 0;
+  const total = files.length;
+  for (const f of files) {
+    const fd = new FormData(); fd.append('file', f, f.name);
+    const x = new XMLHttpRequest();
+    x.open('POST', `/api/upload/${enc(cur.share + '/' + cur.path)}`);
+    x.upload.onprogress = ev => { if (ev.lengthComputable) toast(`업로드 중: ${f.name} ${Math.round(ev.loaded / ev.total * 100)}% (${done}/${total})`); };
+    x.onloadend = () => {
+      done++;
+      if (x.status !== 201) { failed++; toast(`${f.name}: ${x.responseText || '업로드하지 못했습니다'}`); }
+      if (done === total) { if (!failed) toast(`${total}개 파일을 업로드했습니다`); load(); }
+    };
+    x.send(fd);
+  }
+}
+$('#file').addEventListener('change', e => { uploadFiles([...e.target.files]); e.target.value = ''; });
+
+let dragDepth = 0;
+addEventListener('dragenter', e => { if (info.upload && cur.share) { e.preventDefault(); dragDepth++; $('#drop').style.display = 'flex'; } });
+addEventListener('dragleave', () => { if (--dragDepth <= 0) { dragDepth = 0; $('#drop').style.display = 'none'; } });
+addEventListener('dragover', e => e.preventDefault());
+addEventListener('drop', e => {
+  e.preventDefault(); dragDepth = 0; $('#drop').style.display = 'none';
+  uploadFiles([...e.dataTransfer.files].filter(f => f.size || f.type));
+});
+
+addEventListener('hashchange', load);
+(async () => {
+  info = await (await fetch('/api/info')).json();
+  if (!location.hash && info.shares.length === 1) location.hash = href(info.shares[0], '');
+  else load();
+})();
+</script>
+</body>
+</html>
